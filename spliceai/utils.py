@@ -126,6 +126,7 @@ def get_delta_scores(record, ann, dist_var, mask):
         logging.warning('Skipping record (ref too long): {}'.format(record))
         return delta_scores
 
+    all_scores = []
     for j in range(len(record.alts)):
         for i in range(len(idxs)):
 
@@ -143,6 +144,9 @@ def get_delta_scores(record, ann, dist_var, mask):
 
             x_ref = 'N'*pad_size[0]+seq[pad_size[0]:wid-pad_size[1]]+'N'*pad_size[1]
             x_alt = x_ref[:wid//2]+str(record.alts[j])+x_ref[wid//2+ref_len:]
+
+            print("x_ref:", genes[i], ", strand: ", strands[i], x_ref)
+            print("x_alt:", genes[i], ", strand: ", strands[i], x_alt)
 
             x_ref = one_hot_encode(x_ref)[None, :]
             x_alt = one_hot_encode(x_alt)[None, :]
@@ -181,11 +185,23 @@ def get_delta_scores(record, ann, dist_var, mask):
                     axis=1)
 
             y = np.concatenate([y_ref, y_alt])
+            np.save(f'y-{record.chrom}-{record.pos}-{record.ref}-{record.alts[0]}.npy', y)
 
-            idx_pa = (y[1, :, 1]-y[0, :, 1]).argmax()
-            idx_na = (y[0, :, 1]-y[1, :, 1]).argmax()
-            idx_pd = (y[1, :, 2]-y[0, :, 2]).argmax()
-            idx_nd = (y[0, :, 2]-y[1, :, 2]).argmax()
+            # y shape: (2, 10000, 3)
+            #   axis 0: 0=ref, 1=alt
+            #   axis 1: base position in window
+            #   axis 2: 0=neither, 1=acceptor, 2=donor
+            # for any position, the total of the 3 ref probabilities = 1, and the total of the 3 alt probabilites = 1
+            # (based on: https://www.youtube.com/watch?v=oJvhj-tYbBI&start=651)
+            ref_acceptor_probabilities = y[0, :, 1]
+            alt_acceptor_probabilities = y[1, :, 1]
+            ref_donor_probabilities = y[0, :, 2]
+            alt_donor_probabilities = y[1, :, 2]
+
+            idx_pa = (alt_acceptor_probabilities - ref_acceptor_probabilities).argmax()  # delta score: AG
+            idx_na = (ref_acceptor_probabilities - alt_acceptor_probabilities).argmax()  # delta score: AL
+            idx_pd = (alt_donor_probabilities - ref_donor_probabilities).argmax()  # delta score: DG
+            idx_nd = (ref_donor_probabilities - alt_donor_probabilities).argmax()  # delta score: DL
 
             mask_pa = np.logical_and((idx_pa-cov//2 == dist_ann[2]), mask)
             mask_na = np.logical_and((idx_na-cov//2 != dist_ann[2]), mask)
@@ -195,22 +211,30 @@ def get_delta_scores(record, ann, dist_var, mask):
             delta_scores.append("{}|{}|{:.2f}|{:.2f}|{:.2f}|{:.2f}|{}|{}|{}|{}|{:.2f}|{:.2f}|{:.2f}|{:.2f}|{:.2f}|{:.2f}|{:.2f}|{:.2f}".format(
                                 record.alts[j],
                                 genes[i],
-                                (y[1, idx_pa, 1]-y[0, idx_pa, 1])*(1-mask_pa),
-                                (y[0, idx_na, 1]-y[1, idx_na, 1])*(1-mask_na),
-                                (y[1, idx_pd, 2]-y[0, idx_pd, 2])*(1-mask_pd),
-                                (y[0, idx_nd, 2]-y[1, idx_nd, 2])*(1-mask_nd),
-                                idx_pa-cov//2,
-                                idx_na-cov//2,
-                                idx_pd-cov//2,
-                                idx_nd-cov//2,
-                                y[0, idx_pa, 1],
-                                y[1, idx_pa, 1],
-                                y[0, idx_na, 1],
-                                y[1, idx_na, 1],
-                                y[0, idx_pd, 2],
-                                y[1, idx_pd, 2],
-                                y[0, idx_nd, 2],
-                                y[1, idx_nd, 2]))
+                                (y[1, idx_pa, 1]-y[0, idx_pa, 1])*(1-mask_pa),  # delta score: AG
+                                (y[0, idx_na, 1]-y[1, idx_na, 1])*(1-mask_na),  # delta score: AL
+                                (y[1, idx_pd, 2]-y[0, idx_pd, 2])*(1-mask_pd),  # delta score: DG
+                                (y[0, idx_nd, 2]-y[1, idx_nd, 2])*(1-mask_nd),  # delta score: DL
+                                idx_pa-cov//2,    # DP_AG (position: acceptor gain)
+                                idx_na-cov//2,    # DP_AL (position: acceptor loss)
+                                idx_pd-cov//2,    # DP_DG (position: donor gain)
+                                idx_nd-cov//2,    # DP_DL (position: donor loss)
+                                y[0, idx_pa, 1],  # REF acceptor probability @ acceptor gain position
+                                y[1, idx_pa, 1],  # ALT acceptor probability @ acceptor gain position
+                                y[0, idx_na, 1],  # REF acceptor probability @ acceptor loss position
+                                y[1, idx_na, 1],  # ALT acceptor probability @ acceptor loss position
+                                y[0, idx_pd, 2],  # REF donor probability @ donor gain position
+                                y[1, idx_pd, 2],  # ALT donor probability @ donor gain position
+                                y[0, idx_nd, 2],  # REF donor probability @ donor loss position
+                                y[1, idx_nd, 2])) # ALT donor probability @ donor loss position
 
-    return delta_scores
+            all_scores.append({
+                # TODO add position(s)
+                'ref_acceptor_probabilities': ref_acceptor_probabilities,
+                'alt_acceptor_probabilities': alt_acceptor_probabilities,
+                'ref_donor_probabilities': ref_donor_probabilities,
+                'alt_donor_probabilities': alt_donor_probabilities,
+            })
+
+    return delta_scores, all_scores
 

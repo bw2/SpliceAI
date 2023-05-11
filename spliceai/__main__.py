@@ -73,7 +73,7 @@ def main():
     ann = Annotator(args.R, args.A)
 
     for record in vcf:
-        scores = get_delta_scores(record, ann, args.D, args.M)
+        scores, _ = get_delta_scores(record, ann, args.D, args.M)
         if len(scores) > 0:
             record.info['SpliceAI'] = scores
         output.write(record)
