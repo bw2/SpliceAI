@@ -165,6 +165,91 @@ def get_delta_scores_for_transcript(x_ref, x_alt, ref_len, alt_len, strand, cov,
     return y_ref, y_alt, y_alt_with_inserted_bases
 
 
+def get_ref_scores_for_transcript(x_ref, strand, ann):
+    x_ref = one_hot_encode(x_ref)[None, :]
+
+    if strand == '-':
+        x_ref = x_ref[:, ::-1, ::-1]
+
+    y_ref = np.mean([ann.models[m].predict(x_ref, verbose=0) for m in range(5)], axis=0)
+
+    if strand == '-':
+        y_ref = y_ref[:, ::-1]
+
+    return y_ref
+
+
+def get_reference_scores(chrom, pos, ann, dist_var):
+    """REF-only counterpart of get_delta_scores: no ALT allele needed.
+
+    For each transcript overlapping `pos`, reports the single highest predicted
+    acceptor probability and highest predicted donor probability anywhere in
+    the +/-dist_var window around `pos` (whether or not that position is an
+    annotated splice site), plus the full above-threshold curve for
+    visualization.
+    """
+    cov = 2*dist_var+1
+    wid = 10000+cov
+    scores = []
+
+    (genes, strands, idxs) = ann.get_name_and_strand(chrom, pos)
+    if len(idxs) == 0:
+        return scores
+
+    fasta_chrom = normalise_chrom(chrom, list(ann.ref_fasta.keys())[0])
+    try:
+        seq = ann.ref_fasta[fasta_chrom][pos-wid//2-1:pos+wid//2].seq
+    except (IndexError, ValueError):
+        logging.warning('Skipping position (fasta issue): {}-{}'.format(chrom, pos))
+        return scores
+
+    if len(seq) != wid:
+        logging.warning('Skipping position (near chromosome end): {}-{}'.format(chrom, pos))
+        return scores
+
+    genomic_coords = np.arange(pos - cov//2, pos + cov//2 + 1)
+
+    # transcripts sharing the same tx start/stop & strand share the same REF scores
+    ref_scores_transcript_cache = {}
+    for i in range(len(idxs)):
+        dist_ann = ann.get_pos_data(idxs[i], pos)
+        pad_size = [max(wid//2+dist_ann[0], 0), max(wid//2-dist_ann[1], 0)]
+        x_ref = 'N'*pad_size[0]+seq[pad_size[0]:wid-pad_size[1]]+'N'*pad_size[1]
+
+        strand = strands[i]
+        cache_key = (x_ref, strand)
+        if cache_key not in ref_scores_transcript_cache:
+            ref_scores_transcript_cache[cache_key] = get_ref_scores_for_transcript(x_ref, strand, ann)
+        y_ref = ref_scores_transcript_cache[cache_key]
+
+        if len(genomic_coords) != y_ref.shape[1]:
+            raise ValueError(f"SpliceAI internal error: len(genomic_coords) != y_ref.shape[1]: "
+                              f"{len(genomic_coords)} != {y_ref.shape[1]}")
+
+        idx_a = int(y_ref[0, :, 1].argmax())
+        idx_d = int(y_ref[0, :, 2].argmax())
+
+        scores.append({
+            "NAME": genes[i],
+            "STRAND": strand,
+            "RA_MAX": f"{y_ref[0, idx_a, 1]:{FLOAT_FORMAT}}",
+            "RA_MAX_POS": idx_a - cov//2,  # offset from the queried position, matching DP_AG/DP_AL/DP_DG/DP_DL
+            "RD_MAX": f"{y_ref[0, idx_d, 2]:{FLOAT_FORMAT}}",
+            "RD_MAX_POS": idx_d - cov//2,
+            "ALL_NON_ZERO_SCORES": [
+                {
+                    "pos": int(genomic_coord),
+                    "RA": f"{ra_score:{FLOAT_FORMAT}}",
+                    "RD": f"{rd_score:{FLOAT_FORMAT}}",
+                } for i2, (genomic_coord, ra_score, rd_score) in enumerate(zip(
+                    genomic_coords, y_ref[0, :, 1], y_ref[0, :, 2])
+                ) if ra_score >= MIN_SCORE_THRESHOLD or rd_score >= MIN_SCORE_THRESHOLD or i2 in (idx_a, idx_d)
+            ],
+        })
+
+    return scores
+
+
 def get_delta_scores(record, ann, dist_var, mask):
 
     cov = 2*dist_var+1
