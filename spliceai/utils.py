@@ -415,7 +415,7 @@ def get_delta_scores(record, ann, dist_var, mask):
                         "AD": f"{alt_donor_score:{FLOAT_FORMAT}}",
                     } for i, (genomic_coord, ref_acceptor_score, alt_acceptor_score, ref_donor_score, alt_donor_score) in enumerate(zip(
                         genomic_coords, y_ref[0, :, 1], y_alt[0, :, 1], y_ref[0, :, 2], y_alt[0, :, 2])
-                    ) if any(score >= MIN_SCORE_THRESHOLD for score in (ref_acceptor_score, alt_acceptor_score, ref_donor_score, ref_acceptor_score))
+                    ) if any(score >= MIN_SCORE_THRESHOLD for score in (ref_acceptor_score, alt_acceptor_score, ref_donor_score, alt_donor_score))
                          or i in (idx_pa, idx_na, idx_pd, idx_nd)
                 ],
                 "SCORES_FOR_INSERTED_BASES": [] if y_alt_inserted_bases is None else [
