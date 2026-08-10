@@ -6,3 +6,6 @@ build/
 dist/
 *.egg-info/
 .eggs/
+
+# macOS Finder metadata
+.DS_Store
