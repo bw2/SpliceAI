@@ -28,7 +28,7 @@ INFO_FIELD_KEYS = [
     'DS_DL_ALT',
 ]
 
-FLOAT_FORMAT = "0.2f"
+FLOAT_FORMAT = "0.3f"
 
 # the minimum raw score for a position to be included in the ALL_NON_ZERO_SCORES array
 MIN_SCORE_THRESHOLD = 0.01
@@ -386,6 +386,38 @@ def get_delta_scores(record, ann, dist_var, mask):
             else:
                 inserted_bases_genomic_coords = ref_seq = alt_seq = y_ref_inserted_bases = y_alt_inserted_bases = None
 
+            # Report every position that clears the threshold and the positions where the delta
+            # scores are maximized, as before, plus the variant's own position -- that one even
+            # when nothing there clears the threshold, since it is what the caller asked about.
+            all_non_zero_scores = []
+            for window_i in sorted(
+                    {int(i) for i in np.flatnonzero(
+                        np.max(np.stack([y_ref[0, :, 1], y_alt[0, :, 1], y_ref[0, :, 2], y_alt[0, :, 2]]), axis=0) >= MIN_SCORE_THRESHOLD)}
+                    | {int(idx_pa), int(idx_na), int(idx_pd), int(idx_nd), cov//2}):
+                genomic_coord = int(genomic_coords[window_i])
+                reference_base = seq[genomic_coord - record.pos + wid//2].upper()
+                if genomic_coord == record.pos and ref_len != alt_len:
+                    # insertion or deletion: show the whole alleles on the anchor row, the way
+                    # the variant itself is written
+                    ref_base, alt_base = record.ref, record.alts[j]
+                elif record.pos <= genomic_coord < record.pos + ref_len:
+                    # covered by the REF allele: for an equal-length substitution each position
+                    # has its own ALT base, otherwise the base is deleted by the variant
+                    ref_base = reference_base
+                    alt_base = record.alts[j][genomic_coord - record.pos] if ref_len == alt_len else "-"
+                else:
+                    ref_base, alt_base = reference_base, reference_base
+
+                all_non_zero_scores.append({
+                    "pos": genomic_coord,
+                    "ref": ref_base,
+                    "alt": alt_base,
+                    "RA": f"{y_ref[0, window_i, 1]:{FLOAT_FORMAT}}",
+                    "AA": f"{y_alt[0, window_i, 1]:{FLOAT_FORMAT}}",
+                    "RD": f"{y_ref[0, window_i, 2]:{FLOAT_FORMAT}}",
+                    "AD": f"{y_alt[0, window_i, 2]:{FLOAT_FORMAT}}",
+                })
+
             scores.append({
                 "ALLELE": record.alts[j],
                 "NAME": genes[i],
@@ -406,18 +438,7 @@ def get_delta_scores(record, ann, dist_var, mask):
                 "DS_AL_ALT": f"{y[1, idx_na, 1]:{FLOAT_FORMAT}}",
                 "DS_DG_ALT": f"{y[1, idx_pd, 2]:{FLOAT_FORMAT}}",
                 "DS_DL_ALT": f"{y[1, idx_nd, 2]:{FLOAT_FORMAT}}",
-                "ALL_NON_ZERO_SCORES": [
-                    {
-                        "pos": int(genomic_coord),
-                        "RA": f"{ref_acceptor_score:{FLOAT_FORMAT}}",
-                        "AA": f"{alt_acceptor_score:{FLOAT_FORMAT}}",
-                        "RD": f"{ref_donor_score:{FLOAT_FORMAT}}",
-                        "AD": f"{alt_donor_score:{FLOAT_FORMAT}}",
-                    } for i, (genomic_coord, ref_acceptor_score, alt_acceptor_score, ref_donor_score, alt_donor_score) in enumerate(zip(
-                        genomic_coords, y_ref[0, :, 1], y_alt[0, :, 1], y_ref[0, :, 2], y_alt[0, :, 2])
-                    ) if any(score >= MIN_SCORE_THRESHOLD for score in (ref_acceptor_score, alt_acceptor_score, ref_donor_score, alt_donor_score))
-                         or i in (idx_pa, idx_na, idx_pd, idx_nd)
-                ],
+                "ALL_NON_ZERO_SCORES": all_non_zero_scores,
                 "SCORES_FOR_INSERTED_BASES": [] if y_alt_inserted_bases is None else [
                     {
                         "chrom": chrom,
