@@ -198,13 +198,17 @@ def get_reference_scores(chrom, pos, ann, dist_var):
 
     fasta_chrom = normalise_chrom(chrom, list(ann.ref_fasta.keys())[0])
     try:
-        seq = ann.ref_fasta[fasta_chrom][pos-wid//2-1:pos+wid//2].seq
+        # The start index is clamped because pyfastx does not raise on a negative one: it
+        # segfaults, taking the whole process with it. A window that overruns the *end* of a
+        # contig is already answered with a short read, so clamping makes the two edges behave
+        # the same way and the length check below rejects both.
+        seq = ann.ref_fasta[fasta_chrom][max(pos-wid//2-1, 0):pos+wid//2].seq
     except (IndexError, ValueError):
         logging.warning('Skipping position (fasta issue): {}-{}'.format(chrom, pos))
         return scores
 
     if len(seq) != wid:
-        logging.warning('Skipping position (near chromosome end): {}-{}'.format(chrom, pos))
+        logging.warning('Skipping position (too close to a chromosome end): {}-{}'.format(chrom, pos))
         return scores
 
     genomic_coords = np.arange(pos - cov//2, pos + cov//2 + 1)
@@ -268,17 +272,22 @@ def get_delta_scores(record, ann, dist_var, mask):
 
     chrom = normalise_chrom(record.chrom, list(ann.ref_fasta.keys())[0])
     try:
-        seq = ann.ref_fasta[chrom][record.pos-wid//2-1:record.pos+wid//2].seq
+        # See the matching comment in get_reference_scores: a negative start index segfaults
+        # pyfastx rather than raising, so clamp it and let the length check below reject the
+        # window the same way it already rejects one that overruns the end of a contig.
+        seq = ann.ref_fasta[chrom][max(record.pos-wid//2-1, 0):record.pos+wid//2].seq
     except (IndexError, ValueError):
         logging.warning('Skipping record (fasta issue): {}'.format(record))
         return scores
 
-    if seq[wid//2:wid//2+len(record.ref)].upper() != record.ref:
-        logging.warning('Skipping record (ref issue): {}'.format(record))
+    # Checked before the REF comparison below, which reads seq at a fixed offset of wid//2 and
+    # so is only looking at the variant's own base when the window came back whole.
+    if len(seq) != wid:
+        logging.warning('Skipping record (too close to a chromosome end): {}'.format(record))
         return scores
 
-    if len(seq) != wid:
-        logging.warning('Skipping record (near chromosome end): {}'.format(record))
+    if seq[wid//2:wid//2+len(record.ref)].upper() != record.ref:
+        logging.warning('Skipping record (ref issue): {}'.format(record))
         return scores
 
     if len(record.ref) > 2*dist_var:
