@@ -68,11 +68,14 @@ def align_ref_and_alt_scores(y_ref, y_alt, ref, alt, cov):
     - same length (an SNV or MNV): the positions already line up
     - one-base ALT (a deletion): the anchor base keeps its score and the deleted bases get zero
     - one-base REF (an insertion): the anchor base gets the highest score among itself and the inserted bases
-    - otherwise (a deletion-insertion): the whole span is reported once, at its first position, where the
-      REF track carries the highest score among the replaced bases and the ALT track the highest score
-      among the bases put in their place, so the difference between the two is what the variant changed.
-      Every later position of the span is given the same value on both tracks, which reports no change
-      there.
+    - otherwise (a deletion-insertion): the whole span is reported once, at the position holding the
+      highest REF score in it, where the ALT track carries the highest score among the bases put in the
+      span's place, so the difference between the two is what the variant changed. Every other position
+      of the span is given its REF score on both tracks, which reports no change there. Reporting at the
+      strongest REF position rather than at the span's first base keeps a splice site the variant
+      replaces at its own coordinate, which is what masking needs, since it keeps a loss only where a
+      splice site is annotated. Acceptor and donor are scored on separate channels and reported
+      separately, so each picks its own position.
 
     The two one-base cases keep SpliceAI's original handling, since an insertion or deletion written with a
     single anchor base was never part of the multi-base support this module replaces.
@@ -108,21 +111,18 @@ def align_ref_and_alt_scores(y_ref, y_alt, ref, alt, cov):
             axis=1)
 
     # A deletion-insertion replaces every base of the span at once, so no base inside it has a counterpart
-    # to be compared against. Its first position carries the comparison for the whole span, and every
-    # position after it holds its REF score on both tracks, so the difference between the tracks, which is
-    # what the caller reports as a change, is zero there.
-    rest_of_span = y_ref[:, start+1:start+len(ref)]
-    return (
-        np.concatenate([
-            y_ref[:, :start],
-            np.max(y_ref[:, start:start+len(ref)], axis=1)[:, None, :],
-            rest_of_span,
-            y_ref[:, start+len(ref):]],
-            axis=1),
-        np.concatenate([
-            y_alt[:, :start],
-            np.max(y_alt[:, start:start+len(alt)], axis=1)[:, None, :],
-            rest_of_span,
-            y_alt[:, start+len(alt):]],
-            axis=1),
-    )
+    # to be compared against. The comparison for the whole span is reported at the position holding the
+    # strongest REF score, so that a splice site the variant replaces keeps its score at its own
+    # coordinate; np.argmax takes the first maximum, which is the earliest genomic position when several
+    # tie. Acceptor and donor are separate channels, so each picks its own position. Every other position
+    # of the span holds its REF score on both tracks, so the difference between the tracks, which is what
+    # the caller reports as a change, is zero there. The REF track itself needs no rewriting, since the
+    # strongest REF score already sits at that position.
+    span_ref = y_ref[:, start:start+len(ref)]
+    y_alt_span = span_ref.copy()
+    np.put_along_axis(
+        y_alt_span,
+        np.argmax(span_ref, axis=1)[:, None, :],
+        np.max(y_alt[:, start:start+len(alt)], axis=1)[:, None, :],
+        axis=1)
+    return y_ref, np.concatenate([y_alt[:, :start], y_alt_span, y_alt[:, start+len(alt):]], axis=1)

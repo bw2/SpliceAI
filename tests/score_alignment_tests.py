@@ -141,33 +141,74 @@ class AlignRefAndAltScoresTest(unittest.TestCase):
             [y_alt[:, :CENTER+1], np.max(y_alt[:, CENTER+1:CENTER+3], axis=1)[:, None, :], y_alt[:, CENTER+3:]],
             axis=1))
 
-    # --- a deletion-insertion reports its whole span once, at the span's first position ---
+    # --- a deletion-insertion reports its whole span once, where the REF signal is strongest ---
 
-    def test_deletion_insertion_reports_the_strongest_site_on_each_side(self):
-        y_ref, y_alt, aligned_ref, aligned_alt = self.align("AT", "GCC")
-        np.testing.assert_array_equal(aligned_ref[:, CENTER], np.max(y_ref[:, CENTER:CENTER+2], axis=1))
-        np.testing.assert_array_equal(aligned_alt[:, CENTER], np.max(y_alt[:, CENTER:CENTER+3], axis=1))
+    def peaked(self, ref, alt, peak_offset):
+        """Align with one strong REF score `peak_offset` bases into the window, the rest flat."""
+        y_ref = np.full((1, COV, 3), 0.05)
+        y_alt = np.full((1, COV + len(alt) - len(ref), 3), 0.05)
+        y_ref[0, CENTER + peak_offset, :] = 0.9
+        aligned_ref, aligned_alt = align_ref_and_alt_scores(y_ref, y_alt, ref, alt, COV)
+        return y_ref, y_alt, aligned_ref, aligned_alt
+
+    def test_deletion_insertion_is_reported_at_the_strongest_ref_position(self):
+        # Wherever the site the variant replaces sits inside the span, the comparison is reported at that
+        # position. Masking keeps a loss only where a splice site is annotated, so reporting it at the
+        # span's first base instead would have thrown the loss away whenever the site was not that base.
+        for peak_offset in (0, 1, 2):
+            with self.subTest(peak_offset=peak_offset):
+                y_ref, y_alt, _, aligned_alt = self.peaked("ATG", "CC", peak_offset)
+                anchor = CENTER + peak_offset
+                np.testing.assert_array_equal(
+                    aligned_alt[:, anchor], np.max(y_alt[:, CENTER:CENTER+2], axis=1))
+                for other in sorted({CENTER, CENTER+1, CENTER+2} - {anchor}):
+                    np.testing.assert_array_equal(aligned_alt[:, other], y_ref[:, other])
+
+    def test_each_channel_is_reported_at_its_own_strongest_position(self):
+        # acceptor and donor are scored separately, so a span holding an acceptor at one base and a donor
+        # at another reports each at the base where its own signal is
+        y_ref = np.full((1, COV, 3), 0.05)
+        y_alt = np.full((1, COV - 1, 3), 0.05)
+        y_ref[0, CENTER, 1] = 0.9      # acceptor peaks at the span's first base
+        y_ref[0, CENTER+2, 2] = 0.8    # donor peaks at its last
+        _, aligned_alt = align_ref_and_alt_scores(y_ref, y_alt, "ATG", "CC", COV)
+        self.assertEqual(aligned_alt[0, CENTER, 1], np.max(y_alt[0, CENTER:CENTER+2, 1]))
+        self.assertEqual(aligned_alt[0, CENTER+2, 2], np.max(y_alt[0, CENTER:CENTER+2, 2]))
+        self.assertEqual(aligned_alt[0, CENTER+2, 1], y_ref[0, CENTER+2, 1])
+        self.assertEqual(aligned_alt[0, CENTER, 2], y_ref[0, CENTER, 2])
+
+    def test_tied_ref_scores_are_reported_at_the_earliest_position(self):
+        y_ref = np.full((1, COV, 3), 0.05)
+        y_alt = np.full((1, COV - 1, 3), 0.05)
+        y_ref[0, CENTER, :] = y_ref[0, CENTER+2, :] = 0.7
+        _, aligned_alt = align_ref_and_alt_scores(y_ref, y_alt, "ATG", "CC", COV)
+        np.testing.assert_array_equal(aligned_alt[:, CENTER], np.max(y_alt[:, CENTER:CENTER+2], axis=1))
+        np.testing.assert_array_equal(aligned_alt[:, CENTER+2], y_ref[:, CENTER+2])
+
+    def test_deletion_insertion_leaves_the_ref_track_untouched(self):
+        # the strongest REF score already sits at the position the span is reported at
+        for ref, alt in (("AT", "GCC"), ("ATG", "GC"), ("GAT", "GGCC")):
+            with self.subTest(ref=ref, alt=alt):
+                y_ref, _, aligned_ref, _ = self.align(ref, alt)
+                np.testing.assert_array_equal(aligned_ref, y_ref)
 
     def test_deletion_insertion_leaves_the_rest_of_the_span_showing_no_change(self):
-        # the replaced bases after the first carry their REF scores on both sides, where zeros used to make
-        # each of them look like a splice site the variant had destroyed
-        y_ref, _, aligned_ref, aligned_alt = self.align("ATG", "GC")
-        np.testing.assert_array_equal(aligned_ref[:, CENTER+1:CENTER+3], y_ref[:, CENTER+1:CENTER+3])
+        y_ref, _, _, aligned_alt = self.peaked("ATG", "GC", 0)
         np.testing.assert_array_equal(aligned_alt[:, CENTER+1:CENTER+3], y_ref[:, CENTER+1:CENTER+3])
 
     def test_deletion_insertion_leaves_positions_outside_the_span_alone(self):
         y_ref, y_alt, aligned_ref, aligned_alt = self.align("AT", "GCC")
-        np.testing.assert_array_equal(aligned_ref[:, :CENTER], y_ref[:, :CENTER])
-        np.testing.assert_array_equal(aligned_ref[:, CENTER+2:], y_ref[:, CENTER+2:])
+        np.testing.assert_array_equal(aligned_ref, y_ref)
         np.testing.assert_array_equal(aligned_alt[:, :CENTER], y_alt[:, :CENTER])
         np.testing.assert_array_equal(aligned_alt[:, CENTER+2:], y_alt[:, CENTER+3:])
 
-    def test_deletion_insertion_with_shared_bases_is_reported_at_the_bases_it_changes(self):
-        # GAT>GGCC changes AT>GCC one base later, so the span starts one base after the center
-        y_ref, y_alt, aligned_ref, aligned_alt = self.align("GAT", "GGCC")
-        np.testing.assert_array_equal(aligned_ref[:, :CENTER+1], y_ref[:, :CENTER+1])
-        np.testing.assert_array_equal(aligned_ref[:, CENTER+1], np.max(y_ref[:, CENTER+1:CENTER+3], axis=1))
-        np.testing.assert_array_equal(aligned_alt[:, CENTER+1], np.max(y_alt[:, CENTER+1:CENTER+4], axis=1))
+    def test_deletion_insertion_with_shared_bases_is_reported_inside_the_bases_it_changes(self):
+        # GAT>GGCC changes AT>GCC one base later, so the span covers CENTER+1 and CENTER+2
+        y_ref, y_alt, _, aligned_alt = self.peaked("GAT", "GGCC", 2)
+        np.testing.assert_array_equal(aligned_alt[:, :CENTER+1], y_alt[:, :CENTER+1])
+        np.testing.assert_array_equal(aligned_alt[:, CENTER+1], y_ref[:, CENTER+1])
+        np.testing.assert_array_equal(
+            aligned_alt[:, CENTER+2], np.max(y_alt[:, CENTER+1:CENTER+4], axis=1))
 
     def test_output_has_one_score_per_ref_position(self):
         for ref, alt in (("G", "A"), ("TG", "TA"), ("GGGC", "G"), ("A", "AGAGAG"), ("CTG", "CT"),

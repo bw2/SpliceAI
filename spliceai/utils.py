@@ -302,9 +302,11 @@ def get_delta_scores(record, ann, dist_var, mask):
             ref_len = len(record.ref)
             alt_len = len(record.alts[j])
 
-            # An allele written with shared leading bases changes, and has its scores collapsed, where
-            # the alleles first differ rather than at the record's own position. Everything below is
-            # measured from there, so that a padded spelling is reported like its shortest one.
+            # An allele written with shared leading bases changes where the alleles first differ rather
+            # than at the record's own position. Everything below is measured from there, so that a
+            # padded spelling is reported like its shortest one. A deletion-insertion's comparison is
+            # collapsed onto the strongest REF base of the span, which can be a later one, and the
+            # acceptor and donor channels choose independently.
             bases_dropped_from_start, trimmed_ref, trimmed_alt = trim_shared_bases(record.ref, str(record.alts[j]))
             changed_span_start = record.pos + bases_dropped_from_start
             anchor_index = cov//2 + bases_dropped_from_start
@@ -403,9 +405,11 @@ def get_delta_scores(record, ann, dist_var, mask):
                 genomic_coord = int(genomic_coords[window_i])
                 reference_base = seq[genomic_coord - record.pos + wid//2].upper()
                 if genomic_coord == changed_span_start and ref_len != alt_len:
-                    # insertion or deletion: show the alleles on the row carrying its scores. They are
-                    # the trimmed ones, since that row is where the bases they change begin; for a
-                    # variant already written with no shared bases they are the whole alleles.
+                    # insertion or deletion: name the alleles where they first differ. They are the
+                    # trimmed ones; for a variant already written with no shared bases they are the
+                    # whole alleles. A deletion-insertion's comparison is reported at the strongest REF
+                    # base of the span instead, which can be a later one, and acceptor and donor can
+                    # pick different ones, so no single row carries "its" scores.
                     ref_base, alt_base = trimmed_ref, trimmed_alt
                 elif changed_span_start <= genomic_coord < changed_span_start + len(trimmed_ref):
                     # one of the bases the variant replaces: for a change of the same length each position
