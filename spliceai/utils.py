@@ -5,6 +5,7 @@ from pyfastx import Fasta
 from keras.models import load_model
 import logging
 from sys import exit
+from spliceai.score_alignment import align_ref_and_alt_scores, span_fits_in_output_window, trim_shared_bases
 
 INFO_FIELD_KEYS = [
     'ALLELE',
@@ -120,9 +121,7 @@ def normalise_chrom(source, target):
     return source
 
 
-def get_delta_scores_for_transcript(x_ref, x_alt, ref_len, alt_len, strand, cov, ann):
-    del_len = max(ref_len-alt_len, 0)
-
+def get_delta_scores_for_transcript(x_ref, x_alt, ref, alt, strand, cov, ann):
     x_ref = one_hot_encode(x_ref)[None, :]
     x_alt = one_hot_encode(x_alt)[None, :]
 
@@ -137,30 +136,11 @@ def get_delta_scores_for_transcript(x_ref, x_alt, ref_len, alt_len, strand, cov,
         y_ref = y_ref[:, ::-1]
         y_alt = y_alt[:, ::-1]
 
-    y_alt_with_inserted_bases = None
-    if ref_len > 1 and alt_len == 1:
-        y_alt = np.concatenate([
-            y_alt[:, :cov//2+alt_len],
-            np.zeros((1, del_len, 3)),
-            y_alt[:, cov//2+alt_len:]],
-            axis=1)
-    elif ref_len == 1 and alt_len > 1:
-        y_alt_with_inserted_bases = y_alt  # save the original scores for inserted bases
-        y_alt = np.concatenate([
-            y_alt[:, :cov//2],
-            np.max(y_alt[:, cov//2:cov//2+alt_len], axis=1)[:, None, :],
-            y_alt[:, cov//2+alt_len:]],
-            axis=1)
-
-    #MNP handling
-    elif ref_len > 1 and alt_len > 1:
-        zblock = np.zeros((1,ref_len-1,3))
-        y_alt = np.concatenate([
-            y_alt[:, :cov//2],
-            np.max(y_alt[:, cov//2:cov//2+alt_len], axis=1)[:, None, :],
-            zblock,
-            y_alt[:, cov//2+alt_len:]],
-            axis=1)
+    # save the original scores for inserted bases. The trimmed alleles decide this, so an insertion
+    # written with shared leading bases keeps the same scores as its shortest spelling.
+    _, trimmed_ref, trimmed_alt = trim_shared_bases(ref, alt)
+    y_alt_with_inserted_bases = y_alt if len(trimmed_ref) == 1 and len(trimmed_alt) > 1 else None
+    y_ref, y_alt = align_ref_and_alt_scores(y_ref, y_alt, ref, alt, cov)
 
     return y_ref, y_alt, y_alt_with_inserted_bases
 
@@ -302,6 +282,13 @@ def get_delta_scores(record, ann, dist_var, mask):
     model_prediction_count = 0
     total_count = 0
     for j in range(len(record.alts)):
+        # An allele that deletes far more than it inserts, or one written with a long run of shared
+        # leading bases, changes bases the output window doesn't reach, leaving nothing there to score.
+        # Skipping it here is what keeps align_ref_and_alt_scores from reducing over an empty slice.
+        if not span_fits_in_output_window(record.ref, str(record.alts[j]), cov):
+            logging.warning('Skipping record (the bases it changes fall outside the scored window): {}'.format(record))
+            continue
+
         for i in range(len(idxs)):
 
             if '.' in record.alts[j] or '-' in record.alts[j] or '*' in record.alts[j]:
@@ -315,12 +302,20 @@ def get_delta_scores(record, ann, dist_var, mask):
             ref_len = len(record.ref)
             alt_len = len(record.alts[j])
 
+            # An allele written with shared leading bases changes, and has its scores collapsed, where
+            # the alleles first differ rather than at the record's own position. Everything below is
+            # measured from there, so that a padded spelling is reported like its shortest one.
+            bases_dropped_from_start, trimmed_ref, trimmed_alt = trim_shared_bases(record.ref, str(record.alts[j]))
+            changed_span_start = record.pos + bases_dropped_from_start
+            anchor_index = cov//2 + bases_dropped_from_start
+            anchor_seq_index = wid//2 + bases_dropped_from_start
+
             x_ref = 'N'*pad_size[0]+seq[pad_size[0]:wid-pad_size[1]]+'N'*pad_size[1]
             x_alt = x_ref[:wid//2]+str(record.alts[j])+x_ref[wid//2+ref_len:]
 
             total_count += 1
             strand = strands[i]
-            args = (x_ref, x_alt, ref_len, alt_len, strand, cov)
+            args = (x_ref, x_alt, record.ref, str(record.alts[j]), strand, cov)
             if args not in delta_scores_transcript_cache:
                 model_prediction_count += 1
                 delta_scores_transcript_cache[args] = get_delta_scores_for_transcript(*args, ann=ann)
@@ -360,34 +355,36 @@ def get_delta_scores(record, ann, dist_var, mask):
             # if the variant is an insertion and the model predicts a change in splicing within the inserted bases,
             # retrieve scores for each inserted base to address https://github.com/broadinstitute/SpliceAI-lookup/issues/84
 
-            if ref_len == 1 and alt_len > 1 and ((DS_AG >= 0.01 and DP_AG == 0) or (DS_DG >= 0.01 and DP_DG == 0)):
+            if (len(trimmed_ref) == 1 and len(trimmed_alt) > 1
+                    and ((DS_AG >= 0.01 and DP_AG == bases_dropped_from_start)
+                         or (DS_DG >= 0.01 and DP_DG == bases_dropped_from_start))):
 
                 inserted_bases_genomic_coords = np.concatenate([
-                    np.arange(record.pos - INSERTED_BASES_CONTEXT + 1, record.pos + 1),
-                    [f"+{offset}" for offset in np.arange(1, alt_len)],
-                    np.arange(record.pos + 1, record.pos + INSERTED_BASES_CONTEXT + 1),
+                    np.arange(changed_span_start - INSERTED_BASES_CONTEXT + 1, changed_span_start + 1),
+                    [f"+{offset}" for offset in np.arange(1, len(trimmed_alt))],
+                    np.arange(changed_span_start + 1, changed_span_start + INSERTED_BASES_CONTEXT + 1),
                 ])
 
                 y_ref_inserted_bases = np.concatenate([
-                    y_ref[:, 1 + cov//2 - INSERTED_BASES_CONTEXT : 1 + cov//2],
-                    np.zeros((1, alt_len - 1, 3)),
-                    y_ref[:, 1 + cov//2 : 1 + cov//2 + INSERTED_BASES_CONTEXT],
+                    y_ref[:, 1 + anchor_index - INSERTED_BASES_CONTEXT : 1 + anchor_index],
+                    np.zeros((1, len(trimmed_alt) - 1, 3)),
+                    y_ref[:, 1 + anchor_index : 1 + anchor_index + INSERTED_BASES_CONTEXT],
                 ], axis=1)
 
                 y_alt_inserted_bases = y_alt_with_inserted_bases[
-                    :, 1 + cov//2 - INSERTED_BASES_CONTEXT: 1 + cov//2 + (alt_len - 1) + INSERTED_BASES_CONTEXT]
+                    :, 1 + anchor_index - INSERTED_BASES_CONTEXT: 1 + anchor_index + (len(trimmed_alt) - 1) + INSERTED_BASES_CONTEXT]
 
                 assert y_ref_inserted_bases.shape == y_alt_inserted_bases.shape
 
                 ref_seq = (
-                    seq[wid//2 - INSERTED_BASES_CONTEXT + 1: wid//2 + 1] +
-                    " " * (alt_len - 1) +
-                    seq[wid//2 + 1 : wid//2 + 1 + INSERTED_BASES_CONTEXT]
+                    seq[anchor_seq_index - INSERTED_BASES_CONTEXT + 1: anchor_seq_index + 1] +
+                    " " * (len(trimmed_alt) - 1) +
+                    seq[anchor_seq_index + 1 : anchor_seq_index + 1 + INSERTED_BASES_CONTEXT]
                 )
                 alt_seq = (
-                    seq[wid//2 - INSERTED_BASES_CONTEXT + 1: wid//2 + 1] +
-                    record.alts[j][1:] +
-                    seq[wid//2 + len(record.ref) : wid//2 + len(record.ref) + INSERTED_BASES_CONTEXT]
+                    seq[anchor_seq_index - INSERTED_BASES_CONTEXT + 1: anchor_seq_index + 1] +
+                    trimmed_alt[1:] +
+                    seq[anchor_seq_index + len(trimmed_ref) : anchor_seq_index + len(trimmed_ref) + INSERTED_BASES_CONTEXT]
                 )
 
                 assert len(ref_seq) == len(alt_seq), f"len(ref_seq) != len(alt_seq): {len(ref_seq)} != {len(alt_seq)}"
@@ -405,15 +402,16 @@ def get_delta_scores(record, ann, dist_var, mask):
                     | {int(idx_pa), int(idx_na), int(idx_pd), int(idx_nd), cov//2}):
                 genomic_coord = int(genomic_coords[window_i])
                 reference_base = seq[genomic_coord - record.pos + wid//2].upper()
-                if genomic_coord == record.pos and ref_len != alt_len:
-                    # insertion or deletion: show the whole alleles on the anchor row, the way
-                    # the variant itself is written
-                    ref_base, alt_base = record.ref, record.alts[j]
-                elif record.pos <= genomic_coord < record.pos + ref_len:
-                    # covered by the REF allele: for an equal-length substitution each position
+                if genomic_coord == changed_span_start and ref_len != alt_len:
+                    # insertion or deletion: show the alleles on the row carrying its scores. They are
+                    # the trimmed ones, since that row is where the bases they change begin; for a
+                    # variant already written with no shared bases they are the whole alleles.
+                    ref_base, alt_base = trimmed_ref, trimmed_alt
+                elif changed_span_start <= genomic_coord < changed_span_start + len(trimmed_ref):
+                    # one of the bases the variant replaces: for a change of the same length each position
                     # has its own ALT base, otherwise the base is deleted by the variant
                     ref_base = reference_base
-                    alt_base = record.alts[j][genomic_coord - record.pos] if ref_len == alt_len else "-"
+                    alt_base = trimmed_alt[genomic_coord - changed_span_start] if len(trimmed_ref) == len(trimmed_alt) else "-"
                 else:
                     ref_base, alt_base = reference_base, reference_base
 
