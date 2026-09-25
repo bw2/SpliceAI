@@ -9,7 +9,8 @@ import unittest
 
 import numpy as np
 
-from spliceai.score_alignment import align_ref_and_alt_scores, span_fits_in_output_window, trim_shared_bases
+from spliceai.score_alignment import (
+    align_ref_and_alt_scores, get_padded_sequence, span_fits_in_output_window, trim_shared_bases)
 
 # A distance of 5, so the output window has 11 positions and the variant's first base is at index 5.
 COV = 11
@@ -217,6 +218,47 @@ class AlignRefAndAltScoresTest(unittest.TestCase):
                 _, _, aligned_ref, aligned_alt = self.align(ref, alt)
                 self.assertEqual(aligned_ref.shape, (1, COV, 3))
                 self.assertEqual(aligned_alt.shape, (1, COV, 3))
+
+
+class FakeContig:
+    """Stands in for a pyfastx sequence: slicing returns an object whose .seq is the bases, and a slice
+    that runs past the end comes back short rather than raising, as pyfastx's does."""
+
+    def __init__(self, bases):
+        self.bases = bases
+
+    def __getitem__(self, key):
+        return type("Slice", (), {"seq": self.bases[key]})()
+
+
+class GetPaddedSequenceTest(unittest.TestCase):
+
+    def setUp(self):
+        self.contig = FakeContig("ACGTACGTAC")
+
+    def test_a_window_inside_the_contig_is_returned_as_is(self):
+        self.assertEqual(get_padded_sequence(self.contig, 2, 6), "GTAC")
+        self.assertEqual(get_padded_sequence(self.contig, 0, 10), "ACGTACGTAC")
+
+    def test_a_window_past_the_end_is_padded_with_n(self):
+        self.assertEqual(get_padded_sequence(self.contig, 6, 14), "GTACNNNN")
+
+    def test_a_window_before_the_start_is_padded_with_n(self):
+        self.assertEqual(get_padded_sequence(self.contig, -3, 4), "NNNACGT")
+
+    def test_a_window_past_both_ends_is_padded_on_both(self):
+        self.assertEqual(get_padded_sequence(self.contig, -2, 12), "NNACGTACGTACNN")
+
+    def test_the_result_always_has_the_requested_length(self):
+        for start, end in ((-7000, 3001), (5, 20000), (-5, 5), (9, 10), (0, 10)):
+            with self.subTest(start=start, end=end):
+                self.assertEqual(len(get_padded_sequence(self.contig, start, end)), end - start)
+
+    def test_the_variant_base_stays_at_its_offset(self):
+        # utils.py reads the REF at seq[wid//2], which only holds when the padding keeps the offsets
+        for pos in (1, 3, 10):
+            with self.subTest(pos=pos):
+                self.assertEqual(get_padded_sequence(self.contig, pos - 6, pos + 5)[5], "ACGTACGTAC"[pos - 1])
 
 
 if __name__ == "__main__":

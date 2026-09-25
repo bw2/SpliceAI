@@ -5,7 +5,8 @@ from pyfastx import Fasta
 from keras.models import load_model
 import logging
 from sys import exit
-from spliceai.score_alignment import align_ref_and_alt_scores, span_fits_in_output_window, trim_shared_bases
+from spliceai.score_alignment import (
+    align_ref_and_alt_scores, get_padded_sequence, span_fits_in_output_window, trim_shared_bases)
 
 INFO_FIELD_KEYS = [
     'ALLELE',
@@ -178,17 +179,10 @@ def get_reference_scores(chrom, pos, ann, dist_var):
 
     fasta_chrom = normalise_chrom(chrom, list(ann.ref_fasta.keys())[0])
     try:
-        # The start index is clamped because pyfastx does not raise on a negative one: it
-        # segfaults, taking the whole process with it. A window that overruns the *end* of a
-        # contig is already answered with a short read, so clamping makes the two edges behave
-        # the same way and the length check below rejects both.
-        seq = ann.ref_fasta[fasta_chrom][max(pos-wid//2-1, 0):pos+wid//2].seq
+        # Near a contig end the window is padded with N, the way bases outside the gene are below.
+        seq = get_padded_sequence(ann.ref_fasta[fasta_chrom], pos-wid//2-1, pos+wid//2)
     except (IndexError, ValueError):
         logging.warning('Skipping position (fasta issue): {}-{}'.format(chrom, pos))
-        return scores
-
-    if len(seq) != wid:
-        logging.warning('Skipping position (too close to a chromosome end): {}-{}'.format(chrom, pos))
         return scores
 
     genomic_coords = np.arange(pos - cov//2, pos + cov//2 + 1)
@@ -252,18 +246,11 @@ def get_delta_scores(record, ann, dist_var, mask):
 
     chrom = normalise_chrom(record.chrom, list(ann.ref_fasta.keys())[0])
     try:
-        # See the matching comment in get_reference_scores: a negative start index segfaults
-        # pyfastx rather than raising, so clamp it and let the length check below reject the
-        # window the same way it already rejects one that overruns the end of a contig.
-        seq = ann.ref_fasta[chrom][max(record.pos-wid//2-1, 0):record.pos+wid//2].seq
+        # Near a contig end the window is padded with N, the way bases outside the gene are below,
+        # so the REF comparison that follows always reads the variant's own bases at offset wid//2.
+        seq = get_padded_sequence(ann.ref_fasta[chrom], record.pos-wid//2-1, record.pos+wid//2)
     except (IndexError, ValueError):
         logging.warning('Skipping record (fasta issue): {}'.format(record))
-        return scores
-
-    # Checked before the REF comparison below, which reads seq at a fixed offset of wid//2 and
-    # so is only looking at the variant's own base when the window came back whole.
-    if len(seq) != wid:
-        logging.warning('Skipping record (too close to a chromosome end): {}'.format(record))
         return scores
 
     if seq[wid//2:wid//2+len(record.ref)].upper() != record.ref:

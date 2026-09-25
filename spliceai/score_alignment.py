@@ -29,6 +29,29 @@ def trim_shared_bases(ref, alt):
     return bases_dropped_from_start, ref, alt
 
 
+def get_padded_sequence(contig, start, end):
+    """Read the bases from `start` to `end` of a contig, filling in N for any that lie past either end.
+
+    The model reads a fixed 5,000 bases of context on each side of the window it scores, and near a
+    contig end the FASTA has fewer than that. Records there used to be skipped. The model already sees
+    N for every base outside the annotated gene (the pad_size logic in utils.py), so the bases the
+    contig doesn't have are filled in the same way, and the sequence always comes back at the length
+    the caller asked for. The start index is clamped rather than passed through because pyfastx
+    segfaults on a negative one; past the end it simply returns fewer bases.
+
+    Args:
+        contig: a pyfastx sequence (ann.ref_fasta[chrom])
+        start (int): 0-based start index, which may be negative
+        end (int): 0-based exclusive end index, which may lie past the end of the contig
+
+    Returns:
+        str: exactly end - start bases
+    """
+    clamped_start = max(start, 0)
+    seq = contig[clamped_start:end].seq
+    return 'N' * (clamped_start - start) + seq + 'N' * (end - clamped_start - len(seq))
+
+
 def span_fits_in_output_window(ref, alt, cov):
     """Whether the bases a variant changes lie inside the window the scores cover.
 
